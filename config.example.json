@@ -1,0 +1,13 @@
+{
+  "from_name": "Your Name",
+  "from_email": "you@yourcompany.com",
+  "company_name": "Your Company",
+  "product_name": "Your Product",
+  "product_url": "https://yourcompany.com/product",
+  "booking_link": "https://calendly.com/your-link",
+  "internal_domains": ["yourcompany.com"],
+  "client_domains": ["client1.com", "client2.com"],
+  "slack_channel": "C00000000",
+  "crm_database_id": "your-notion-crm-db-id",
+  "linear_team_id": "your-linear-team-id"
+}
