@@ -27,6 +27,7 @@ import base64
 import random
 import urllib.request
 import urllib.error
+from email.utils import getaddresses
 from datetime import datetime, timezone, timedelta
 
 # ── Config ──
@@ -34,14 +35,20 @@ from datetime import datetime, timezone, timedelta
 MATON_KEY = os.environ.get("MATON_API_KEY", "")
 SLACK_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 LINEAR_KEY = os.environ.get("LINEAR_API_KEY", "")
-SLACK_CHANNEL = "C06P8C6R3H8"  # #neb-sales
+
+#: Compose and log every reply but never actually deliver one, and never write
+#: state. A dry run must leave the mailbox eligible for a later live run to handle
+#: the same messages for real, so it deliberately persists nothing.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+
+SLACK_CHANNEL = "{{YOUR_SLACK_CHANNEL_ID}}"
 STATE_FILE = os.path.expanduser("~/.openclaw/workspace/email-responder-state.json")
-CRM_DB_ID = "31b5b322-45b0-8052-adce-ffe58a23f1e1"
+CRM_DB_ID = "{{YOUR_NOTION_CRM_DB_ID}}"
 LOG_FILE = os.path.expanduser("~/logs/email-responder.log")
 
 FROM_EMAIL = "{{YOUR_EMAIL}}"
 FROM_NAME = "{{YOUR_NAME}}"
-INTERNAL_DOMAINS = ["aiadvantageagency.co", "teamnebula.ai"]
+INTERNAL_DOMAINS = ["{{YOUR_DOMAIN}}"]
 
 # Shared writing style injected into every prompt
 WRITING_STYLE = """
@@ -75,14 +82,15 @@ ABSOLUTE RULES:
 MAX_RESPONSES_PER_12H = 9999
 
 # Resources
-HYPERSCALE_URL = "https://teamnebula.ai/hyperscale"
-BOOKING_LINK = "https://calendly.com/d/cx9h-2kx-6n7/discover-team-nebula"
+PRODUCT_URL = "{{YOUR_PRODUCT_URL}}"
+BOOKING_LINK = "{{YOUR_BOOKING_LINK}}"
 
-# Internal/automated senders — never respond
+# Internal/automated senders — never respond.
+# Add your own teammates' addresses here; they are the ones you must never
+# auto-reply to, and they are also the ones you should not publish in a public repo.
 NEVER_RESPOND_PATTERNS = [
-    # Internal team
-    "aj@", "shawn@", "abraham@", "support@aiadvantageagency",
-    "ian@aiadvantageagency",
+    # Internal team — replace with your own
+    "{{YOUR_TEAMMATE_PREFIX}}@",
     # Automated/transactional
     "noreply", "no-reply", "donotreply", "mailer-daemon",
     "billing@", "receipts@", "invoices@", "payments@",
@@ -292,6 +300,17 @@ def extract_email_info(msg):
     name_match = re.match(r'^([^<]+)', from_raw)
     sender_name = name_match.group(1).strip().strip('"') if name_match else sender_email
 
+    # Every occurrence, not just the last: Delivered-To repeats once per hop of a
+    # forwarding chain and the mailbox we care about is often not the final one,
+    # but `headers` above keeps a single value per name.
+    def _joined(name):
+        values = [
+            (h.get("value") or "").strip()
+            for h in msg.get("payload", {}).get("headers", [])
+            if (h.get("name") or "").lower() == name
+        ]
+        return ", ".join(v for v in values if v)
+
     return {
         "id": msg.get("id", ""),
         "thread_id": msg.get("threadId", ""),
@@ -300,8 +319,37 @@ def extract_email_info(msg):
         "subject": headers.get("subject", "(no subject)"),
         "snippet": msg.get("snippet", ""),
         "date": headers.get("date", ""),
+        "to": headers.get("to", ""),
+        "cc": _joined("cc"),
+        "delivered_to": _joined("delivered-to"),
         "body": get_email_body(msg),
     }
+
+
+def is_addressed_to_mailbox(info, mailbox=None):
+    """Whether this delivery names our mailbox exactly, in To, Cc, or Delivered-To.
+
+    Without this check an alias, a forwarded copy, or a list the mailbox merely
+    receives all reach the response pipeline and get answered as if addressed to us.
+
+    Mass cold outreach is BCC'd, so the mailbox appears in neither To nor Cc and
+    only in Gmail's own Delivered-To stamp -- checking To alone would reject the
+    very traffic this agent exists to answer. The address match stays exact, so a
+    different alias on the same domain still does not qualify.
+    """
+    expected = (mailbox or FROM_EMAIL).strip().casefold()
+    if not expected or expected.startswith("{{"):
+        return True  # unconfigured template: do not silently drop everything
+    # getaddresses parses its argument list as one joined field and returns the
+    # malformed sentinel [("", "")] if any element is blank, so a message with no
+    # Cc would fail on an otherwise perfect To header. Drop empties first.
+    sources = [h for h in (info.get("to"), info.get("cc"), info.get("delivered_to"))
+               if (h or "").strip()]
+    if not sources:
+        return False
+    return any(
+        addr.strip().casefold() == expected for _name, addr in getaddresses(sources)
+    )
 
 
 def thread_has_our_reply(thread_id):
@@ -460,7 +508,7 @@ def generate_ai_response(info, message_num, thread_context=""):
 - Pitch {{YOUR_PRODUCT}} as something relevant to THEM or their agency's clients
 - Frame it as: "we built this platform that agencies are using to offer AI transformation to their clients"
 - Position it as a revenue opportunity for their agency, not a sale
-- Include the product link naturally: {HYPERSCALE_URL}
+- Include the product link naturally: {PRODUCT_URL}
 - End with booking link: {BOOKING_LINK}
 - Frame the call as a quick chat to see if there's a fit"""
         else:
@@ -646,7 +694,7 @@ def generate_inquiry_response(info):
 YOUR GOAL: Nurture this lead toward booking a discovery call. Be warm, knowledgeable, genuinely helpful. This person came to YOU.
 
 WHAT WE OFFER:
-{{YOUR_PRODUCT}}: AI transformation platform for mid-market companies ({HYPERSCALE_URL})
+{{YOUR_PRODUCT}}: AI transformation platform for mid-market companies ({PRODUCT_URL})
 Custom AI agent builds: from affordable to enterprise-grade
 AI transformation partnerships: we embed with teams to transform their operations
 Real results: helping enterprises generate 10m+/week from our systems
@@ -791,6 +839,13 @@ Write email body only. Short paragraphs."""
 # ── Send Email ──
 
 def send_reply(info, html_body):
+    if DRY_RUN:
+        # Report success so the caller's downstream flow (thread state, Slack,
+        # counters) exercises exactly the path a live run takes.
+        log(f"DRY RUN: would send reply #{info.get('message_num', '?')} "
+            f"to {info['from_email']} ({len(html_body)} chars)")
+        return True
+
     subject = info["subject"]
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
@@ -1086,6 +1141,12 @@ def main():
 
         # ── STRICT FILTRATION ──
 
+        if not is_addressed_to_mailbox(info):
+            log(f"SKIP (not-addressed-to-mailbox): to={info.get('to')} "
+                f"cc={info.get('cc')} delivered-to={info.get('delivered_to')}")
+            processed_ids.add(msg_id)
+            continue
+
         blocked, reason = is_blocked_sender(sender, info["subject"], crm_emails, crm_domains)
         if blocked:
             log(f"SKIP ({reason}): {sender}")
@@ -1225,7 +1286,10 @@ def main():
     # Save state
     state["processed_ids"] = list(processed_ids)
     state["thread_state"] = thread_state
-    save_state(state)
+    if DRY_RUN:
+        log("DRY RUN: state not written; these messages stay eligible for a live run")
+    else:
+        save_state(state)
     log(f"=== Done. Sent {responses_sent} responses (total today: {recent_count + responses_sent}/{MAX_RESPONSES_PER_12H}) ===")
 
 
