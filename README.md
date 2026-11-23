@@ -65,6 +65,14 @@ domain still does not qualify.
 
 Run the tests with `python3 test_recipient_gate.py` (stdlib only, nothing to install).
 
+## CI
+
+Crow runs `.woodpecker.yaml` on every push and pull request, on the linux/arm64 agent
+on Shawn's Mac. It runs `shellcheck -S warning` and `bash -n` on both shell scripts,
+compiles `email-responder.py`, and runs `python3 test_recipient_gate.py`. The pipeline
+needs no secrets and makes no network calls. A green `ci/crow/...` status on the PR head
+is the merge check.
+
 ## Deploying
 
 `run-email-responder.sh` on cron is the simplest option. `deploy/deploy-cloud-run.sh`

@@ -1,0 +1,19 @@
+# Crow CI for agentic-email-responder. Runs on the linux/arm64 agent on Shawn's Mac.
+# No secrets: the tests import email-responder.py without an API key and never
+# touch the network.
+when:
+  event: [push, pull_request, manual]
+
+steps:
+  shellcheck:
+    image: koalaman/shellcheck-alpine:v0.11.0
+    commands:
+      - shellcheck -S warning run-email-responder.sh deploy/deploy-cloud-run.sh
+
+  tests:
+    image: python:3.13-slim
+    commands:
+      - bash -n run-email-responder.sh
+      - bash -n deploy/deploy-cloud-run.sh
+      - python3 -m py_compile email-responder.py
+      - python3 test_recipient_gate.py -v
