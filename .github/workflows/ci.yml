@@ -1,0 +1,86 @@
+# GitHub fallback for Crow. Crow (.woodpecker.yaml) is the primary check for
+# agentic-email-responder; these jobs run the same checks with the same images when Crow never
+# saw the push. See the CI section of README.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # No `branches:` filter, so stacked PRs (base = another feature branch) are
+  # checked too. ready_for_review is listed so marking a draft ready starts the
+  # full run; the default types do not include it.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Crow CI on Shawn's Mac is the primary check. Crow posts a ci/crow/... status
+  # within seconds of receiving a push, so this job waits up to 3 minutes for one.
+  # If it appears, the jobs below are skipped and Crow's result is the merge check.
+  # If not (Mac asleep or offline, so the webhook was lost), the jobs below run as
+  # the standard GitHub CI. A manual run (workflow_dispatch) always runs them.
+  crow-gate:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "Manual run: running GitHub CI."; echo run=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          for _ in $(seq 1 12); do
+            n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses" \
+              --jq '[.[] | select(.context | startswith("ci/crow/"))] | length' || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "Crow picked up $SHA; skipping GitHub CI (Crow's status is the check)."
+              echo run=false >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 15
+          done
+          echo "No Crow status on $SHA after 3 minutes (Mac asleep or offline); running GitHub CI."
+          echo run=true >> "$GITHUB_OUTPUT"
+
+  # Same image and version as the shellcheck step in .woodpecker.yaml.
+  shellcheck:
+    needs: crow-gate
+    if: needs.crow-gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck (koalaman/shellcheck-alpine:v0.11.0)
+        run: |
+          docker run --rm -i -v "$PWD:/src" -w /src koalaman/shellcheck-alpine:v0.11.0 sh -eu <<'SH'
+          shellcheck -S warning run-email-responder.sh deploy/deploy-cloud-run.sh
+          SH
+
+  # Same image and commands as the tests step in .woodpecker.yaml. No secrets needed.
+  tests:
+    needs: crow-gate
+    if: needs.crow-gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    container: python:3.13-slim
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash -n run-email-responder.sh
+      - run: bash -n deploy/deploy-cloud-run.sh
+      - run: python3 -m py_compile email-responder.py
+      - run: python3 test_recipient_gate.py -v
