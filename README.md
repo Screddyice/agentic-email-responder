@@ -73,20 +73,9 @@ compiles `email-responder.py`, and runs `python3 test_recipient_gate.py`. The pi
 needs no secrets and makes no network calls. A green `ci/crow/...` status on the PR head
 is the merge check.
 
-When Crow never sees a push, for example because the Mac was asleep and GitHub did not
-retry the webhook, GitHub CI takes over. `.github/workflows/ci.yml` runs the same checks
-with the same images on `ubuntu-latest`. Its first job, `crow-gate`, waits up to three
-minutes for a `ci/crow/...` status on the commit. If Crow posted one, the other jobs are
-skipped and Crow's result is the merge check. If none appears, the jobs run and their
-result is the merge check. Starting the workflow by hand (`gh workflow run ci.yml --ref
-<branch>`) always runs the jobs.
-
-`.github/workflows/crow-fallback.yml` covers a Crow run that fails for its own reasons,
-such as a dropped clone, a killed or timed-out run, or Crow being unreachable. It asks
-the Crow API whether a check step failed. If none did, it starts `ci.yml` on the PR
-branch so the PR still gets a real result. A failed check step does not trigger it. It
-needs a `CROW_TOKEN` repository secret to read the Crow API. Without that secret it
-treats every Crow failure as Crow's own and starts GitHub CI.
+A push made while the Mac is asleep or offline gets no CI run, because GitHub does not
+retry the webhook and there is no GitHub CI to fall back on. Push again once the Mac is
+back, or start the pipeline with `crow pipeline create`.
 
 ## Deploying
 
